@@ -139,8 +139,26 @@ clears runtime bridge bindings, after which the running daemon rechecks conflict
 ## Logs and uninstall
 
 `hypr-obs status` prints the log location. Fresh installs use
-`~/.local/state/hypr-obs/bridge.log`; upgraded prototypes may retain
+the user journal for the systemd backend (`hypr-obs logs -f`). Detached-process
+installs use `~/.local/state/hypr-obs/bridge.log`; upgraded prototypes may retain
 `~/.local/state/obs-hotkey-bridge/bridge.log`.
+
+## Daemon/service commands
+
+Normal background use starts with `hypr-obs enable`. You do not need to provide
+`daemon --settings`. `hypr-obs daemon` now discovers settings automatically and
+runs in the foreground for debugging. Stop the background watcher first with
+`hypr-obs stop` if you want to use that mode, then use `hypr-obs start` afterward.
+
+If a systemd desktop reports the process fallback, run:
+
+```sh
+hypr-obs enable --supervisor systemd
+systemctl --user status hypr-obs.service
+```
+
+The first command reports a missing/unreachable user manager directly. Run it
+inside the normal desktop session without sudo. See [Background service](service.md).
 
 Uninstall removes only the exact loader block originally added. If that block
 was edited, it is left intact with an explanation. It does not restore an old

@@ -28,6 +28,11 @@ if '-i' in args:
 json_mode='-j' in args
 if json_mode:args.remove('-j')
 command=args[0]
+sessions_path=base/'sessions.json'
+sessions=json.loads(sessions_path.read_text()) if sessions_path.exists() else [
+    {'instance':os.environ['HYPRLAND_INSTANCE_SIGNATURE'],'pid':int(os.environ['BRIDGE_SIM_PARENT'])}]
+if command!='instances' and not sessions:
+    print('Hyprland is not running');sys.exit(1)
 state_path=base/'binds.json'
 state=json.loads(state_path.read_text())
 def save():
@@ -39,7 +44,7 @@ def add(keys,target,description):
     mods=sum({'SHIFT':1,'CTRL':4,'ALT':8,'SUPER':64}[x] for x in parts[:-1])
     state.append({'key':parts[-1],'keycode':0,'modmask':mods,'description':description,'dispatcher':'pass','arg':target,'submap':''})
 if command=='instances':
-    print(json.dumps([{'instance':os.environ['HYPRLAND_INSTANCE_SIGNATURE'],'pid':int(os.environ['BRIDGE_SIM_PARENT'])}]))
+    print(json.dumps(sessions))
 elif command=='clients':print((base/'clients.json').read_text())
 elif command=='binds':print(json.dumps(state))
 elif command=='eval':
@@ -94,16 +99,20 @@ class DaemonLifecycle(unittest.TestCase):
 
             set_client("0xabc")
             (base / "binds.json").write_text("[]")
-            state = base / "state"
-            state.mkdir()
-            settings = base / "settings.json"
+            state = base / "state/hypr-obs"
+            state.mkdir(parents=True)
+            settings = base / "config/hypr-obs/settings.json"
+            settings.parent.mkdir(parents=True)
             settings.write_text(json.dumps({"token": "simulation", "state_dir": str(state), "interval": 1.0,
                                             "hypr_config": str(base / "hyprland.conf"), "obs_config": str(obs)}))
             env = {**os.environ, "PATH": str(base) + os.pathsep + os.environ.get("PATH", ""),
                    "XDG_RUNTIME_DIR": str(base / "runtime"),
+                   "XDG_CONFIG_HOME": str(base / "config"), "XDG_STATE_HOME": str(base / "state"),
                    "HYPRLAND_INSTANCE_SIGNATURE": "bridge_test_" + base.name,
                    "BRIDGE_SIM_PARENT": str(os.getpid()), "BRIDGE_SIM_DIR": str(base),
                    "BRIDGE_SIM_BACKEND": backend}
+            sessions = base / "sessions.json"
+            sessions.write_text("[]")  # service may start before the desktop exists
             event_path = base / "runtime/hypr" / env["HYPRLAND_INSTANCE_SIGNATURE"] / ".socket2.sock"
             event_path.parent.mkdir(parents=True)
             server = None
@@ -118,26 +127,38 @@ class DaemonLifecycle(unittest.TestCase):
                     server.close()
                 server = None
             output = (base / "daemon.log").open("w+")
-            process = subprocess.Popen([sys.executable, str(SCRIPT), "daemon", "--settings", str(settings)],
+            process = subprocess.Popen([sys.executable, str(SCRIPT), "daemon"],
                                        env=env, stdout=output, stderr=output)
             try:
-                if server:
-                    connection, _ = server.accept()
-                def wait_for(predicate, seconds=7):
+                def wait_for(predicate, seconds=7, status=False):
                     deadline = time.monotonic() + seconds
                     while time.monotonic() < deadline:
                         if process.poll() is not None:
                             output.seek(0)
                             self.fail("Daemon exited: " + output.read())
-                        current = json.loads((base / "binds.json").read_text())
+                        path = state / "status.json" if status else base / "binds.json"
+                        try:
+                            current = json.loads(path.read_text())
+                        except (FileNotFoundError, json.JSONDecodeError):
+                            time.sleep(0.05)
+                            continue
                         if predicate(current):
                             return current
                         time.sleep(0.05)
                     output.seek(0)
                     self.fail("Timed out waiting for simulated binds: " + output.read())
 
+                wait_for(lambda x: x.get("phase") == "waiting_for_hyprland", status=True)
+                sessions.write_text(json.dumps([{"instance": env["HYPRLAND_INSTANCE_SIGNATURE"], "pid": os.getpid()}]))
+                if server:
+                    connection, _ = server.accept()
                 first = wait_for(lambda x: len(x) == 1 and x[0]["key"] == "F9")
                 self.assertEqual(first[0]["arg"], "address:0xabc")
+                duplicate = subprocess.run([sys.executable, str(SCRIPT), "daemon"], env=env,
+                                           text=True, capture_output=True, timeout=5)
+                self.assertEqual(duplicate.returncode, 0)
+                self.assertIn("already running", duplicate.stdout)
+                self.assertEqual(json.loads((state / "status.json").read_text())["daemon_pid"], process.pid)
                 # A compositor reload removes dynamic bindings. The real
                 # socket2 event or periodic recovery should reconstruct them.
                 (base / "binds.json").write_text("[]")
@@ -162,6 +183,19 @@ class DaemonLifecycle(unittest.TestCase):
                 wait_for(lambda x: not x)
                 set_client("0xdef")
                 wait_for(lambda x: len(x) == 1 and x[0]["arg"] == "address:0xdef")
+                # Lose the compositor, then replace it with a new instance
+                # signature while the watcher process itself stays alive.
+                sessions.write_text("[]")
+                if connection:
+                    connection.close()
+                    connection = None
+                wait_for(lambda x: x.get("phase") == "waiting_for_hyprland", status=True)
+                (base / "binds.json").write_text("[]")
+                set_client("0xfeed")
+                new_signature = "restarted_" + base.name
+                sessions.write_text(json.dumps([{"instance": new_signature, "pid": os.getpid()}]))
+                wait_for(lambda x: len(x) == 1 and x[0]["arg"] == "address:0xfeed")
+                wait_for(lambda x: x.get("session") == new_signature and x.get("phase") == "watching", status=True)
                 process.send_signal(signal.SIGTERM)
                 process.wait(timeout=5)
                 self.assertEqual(process.returncode, 0)

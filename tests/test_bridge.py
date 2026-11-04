@@ -54,6 +54,9 @@ class FilesystemTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.base = Path(self.temporary.name)
         self.addCleanup(self.temporary.cleanup)
+        manager = patch.object(b, "systemd_available", return_value=False)
+        manager.start()
+        self.addCleanup(manager.stop)
 
     def write(self, path, text):
         path = self.base / path

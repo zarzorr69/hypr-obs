@@ -15,6 +15,9 @@ use an isolated desktop/test account when developing changes to installation.
 
 Tests use temporary directories and a simulated `hyprctl`. Daemon tests use an
 event socket when permitted; otherwise they exercise the periodic repair path.
+Service-control tests mock `systemctl`; they never install a unit into the
+developer's actual user manager. Generated unit syntax is verified separately
+with `systemd-analyze verify` in CI.
 They do not establish that Qt receives an actual physical keyboard event.
 
 For a live verification report, include:

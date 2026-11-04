@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0 — 2026-11-04
+
+- Prefer an automatically enabled systemd user service with crash restart.
+- Add start, stop, restart and live logs commands.
+- Make `daemon` a usable foreground watcher with automatically discovered settings.
+- Keep the worker alive while Hyprland is absent and reconnect after session restarts.
+- Refresh only allowlisted session/display variables for the service.
+- Report service activity, PID, restart count and watcher phase in status.
+- Retain a detached-process fallback for desktops without a user manager.
+- Stop/remove the service before disabling or uninstalling its cached worker.
+- Add service lifecycle regression tests and generated-unit syntax verification.
+
 ## 0.1.0 — 2026-11-04
 
 First public `hypr-obs` package, following the `obs-hotkey-bridge.py` prototype.

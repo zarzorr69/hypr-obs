@@ -40,9 +40,19 @@ Lua loaders are placed before a possible top-level return. Symlinks are
 resolved without replacing them.
 
 The daemon runs outside compositor callbacks, observes socket2 window/reload
-events when available, and polls saved settings periodically. Binding queries
+events when available, and polls saved settings periodically. A global worker
+lock prevents duplicates, and a session lock is retained for prototype compatibility.
+Its outer loop waits for Hyprland and reconnects across compositor restarts.
+Binding queries
 and mutations happen on a changed plan, relevant event, or a periodic repair
-check. Mutations are batched. A session lock prevents duplicate daemons.
+check. Mutations are batched.
+
+On a systemd desktop, `enable` installs a user unit with a restart policy and
+starts it through `systemctl --user`. A small allowlisted session snapshot lets
+the service attach to the desktop without copying the full shell environment
+into the user manager. Other desktops retain the detached-process backend.
+The same start/stop/restart interface controls either backend. Service output
+goes to the journal; detached-process output goes to the bridge log.
 
 Only the bridge's described runtime bindings are managed. Existing binds are
 checked before additions/removals. Lua bind handles allow exact removal on

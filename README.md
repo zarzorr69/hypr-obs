@@ -18,13 +18,19 @@ Run from a terminal in your Hyprland desktop, as your normal user:
 curl -fsSL https://raw.githubusercontent.com/zarzorr69/hypr-obs/main/install.sh | sh
 ```
 
-The installer adds `hypr-obs` to `~/.local/bin` and enables forwarding at login.
+The installer adds `hypr-obs` to `~/.local/bin` and enables a continuously running
+**`hypr-obs.service` user service** when your systemd user manager is available.
+It starts at user login, waits for Hyprland/OBS, checks saved hotkeys every three
+seconds, and restarts after an unexpected worker exit. You do not need to run
+the daemon command or rerun setup whenever you add a shortcut.
 Keep OBS's main window open on any workspace. In OBS, choose **Settings →
 Advanced → Hotkeys → Hotkey Focus Behavior → Never disable hotkeys**.
 
 Requirements: **Linux, Python 3.9+, Hyprland and `hyprctl`**. The standalone
 command has no pip dependencies and does not require sudo, an OBS plugin,
-WebSocket credentials or systemd. `curl` or `wget` is needed only for downloading.
+WebSocket credentials. On desktops without an available systemd user manager,
+it falls back to a detached watcher started by Hyprland. `curl` or `wget` is
+needed only for downloading.
 
 If `~/.local/bin` is not on your PATH, the installer reports it. On fish:
 
@@ -70,9 +76,14 @@ hypr-obs enable
 | Command | Result |
 | --- | --- |
 | `hypr-obs enable` | Discover OBS, install forwarding, and start it at login |
+| `hypr-obs start` | Start the configured watcher now |
+| `hypr-obs stop` | Stop it now while keeping login autostart configured |
+| `hypr-obs restart` | Restart the watcher |
 | `hypr-obs status` | Show running state, discovered files, shortcuts and conflicts |
 | `hypr-obs status --json` | Show machine-readable status |
+| `hypr-obs logs --follow` | Follow live watcher logs |
 | `hypr-obs doctor` | Preview discovery and conflicts without changing anything |
+| `hypr-obs daemon` | Run the watcher in the foreground for debugging; settings are automatic |
 | `hypr-obs disable` | Stop forwarding and remove its startup hook; keep the command |
 | `hypr-obs uninstall` | Disable forwarding and remove the standalone command |
 | `hypr-obs --version` | Print the version |
@@ -81,6 +92,18 @@ hypr-obs enable
 The `install` subcommand is an alias for `enable` for compatibility with the
 original script. `setup` installs the command itself and is normally called by
 `install.sh`.
+
+On a systemd desktop you can also use the standard service tools:
+
+```sh
+systemctl --user status hypr-obs.service
+systemctl --user restart hypr-obs.service
+journalctl --user -u hypr-obs.service -f
+```
+
+See [Background service](docs/service.md) for service lifecycle and foreground
+debugging. The watcher follows saved OBS/Aitum hotkeys; it does not execute
+arbitrary shell commands or require a separate list of shortcuts.
 
 ## What it reads
 
@@ -109,6 +132,8 @@ hypr-obs enable --hypr-config /path/to/active/hyprland.lua
 hypr-obs enable --obs-config /path/to/obs-studio
 hypr-obs enable --profile Work --collection Gaming.json
 hypr-obs enable --interval 5
+hypr-obs enable --supervisor systemd  # require a supervised user service
+hypr-obs enable --supervisor process  # non-systemd fallback
 ```
 
 `--obs-config` points to the directory ending in `obs-studio`. The collection
@@ -149,11 +174,13 @@ XWayland forwarding has compositor limitations, and hiding OBS to the tray
 removes its window target. Existing rice shortcuts are skipped and reported.
 
 The automated suite covers parsing, Aitum storage, native/Flatpak/Snap paths,
-config hooks, upgrades, command installation, uninstall, and real daemon
-subprocesses against a simulated Hyprland IPC interface. **Actual keyboard
+config hooks, upgrades, command installation, service lifecycle/quoting, uninstall,
+and real daemon subprocesses against a simulated Hyprland IPC interface.
+Generated unit syntax is checked with `systemd-analyze verify`. **Actual keyboard
 delivery in a live Hyprland/OBS desktop has not yet been verified for this
-public release.** Packaging support does not imply every downstream build has
-been tested.
+public release, and the user-manager control tests use mocks rather than your
+desktop's actual service manager.** Packaging support does not imply every
+downstream build has been tested.
 
 See [Troubleshooting](docs/troubleshooting.md) for conflicts, incomplete discovery,
 input inhibition, keyboard layouts and custom paths. See [How it works](docs/architecture.md)

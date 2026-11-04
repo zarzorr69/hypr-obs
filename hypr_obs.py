@@ -26,12 +26,16 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 NAME = "hypr-obs"
 LEGACY_NAME = "obs-hotkey-bridge"
+SERVICE = "hypr-obs.service"
+UNIT_MARKER = "# Managed by hypr-obs\n"
+SESSION_VARIABLES = ("HYPRLAND_INSTANCE_SIGNATURE", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DISPLAY", "PATH")
 # Keep the prototype's markers and runtime descriptions compatible so upgrades
 # can replace its daemon without leaving a second startup hook or duplicate binds.
 BEGIN = "OBS-HOTKEY-BRIDGE BEGIN"
@@ -447,7 +451,7 @@ def expand_path(raw, env=None, cwd=None):
 
 
 class Hyprland:
-    def __init__(self):
+    def __init__(self, allow_stale_session=False):
         self.binary = shutil.which("hyprctl")
         if not self.binary:
             raise BridgeError("hyprctl is missing. Run this on the host inside your Hyprland session.")
@@ -455,6 +459,8 @@ class Hyprland:
         result = self.query("instances", instance=False)
         requested = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
         candidates = [x for x in result if x.get("instance") == requested] if requested else result
+        if not candidates and allow_stale_session and len(result) == 1:
+            candidates = result  # a restarted compositor has a new instance signature
         if len(candidates) != 1:
             raise BridgeError("Cannot select one Hyprland session. Run from a terminal inside the intended session.")
         self.instance = candidates[0]
@@ -1056,7 +1062,9 @@ def running_daemon(record):
     pid = int(record.get("daemon_pid", 0))
     args = proc_args(pid) if pid > 0 else []
     installed = record.get("script", "")
-    return pid if installed and installed in args and "daemon" in args else None
+    launcher = record.get("launcher", "")
+    matches = (installed and installed in args) or (launcher and launcher in args)
+    return pid if matches and "daemon" in args else None
 
 
 def stop_daemon(state):
@@ -1067,7 +1075,7 @@ def stop_daemon(state):
     if not pid:
         return
     os.kill(pid, signal.SIGTERM)
-    for _ in range(40):
+    for _ in range(150):
         if not running_daemon(read_json(status_path)):
             return
         # A dead process may remain a zombie while its parent reaps it.
@@ -1080,7 +1088,114 @@ def stop_daemon(state):
     raise BridgeError("Previous bridge daemon did not stop; no files were removed. Check its log.")
 
 
+def systemd_available():
+    binary = shutil.which("systemctl")
+    if not binary:
+        return False
+    try:
+        # Never capture or display the manager's environment; only check that
+        # this user's manager/bus can be reached.
+        result = subprocess.run([binary, "--user", "show-environment"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def systemctl(*arguments, check=True):
+    binary = shutil.which("systemctl")
+    if not binary:
+        raise BridgeError("systemctl is missing; use enable --supervisor process on a non-systemd desktop.")
+    try:
+        result = subprocess.run([binary, "--user", *arguments], capture_output=True,
+                                text=True, timeout=25, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BridgeError(f"Cannot contact the user service manager: {exc}") from exc
+    if check and result.returncode:
+        raise BridgeError("User service operation failed: " + (result.stderr.strip() or result.stdout.strip()))
+    return result
+
+
+def service_info():
+    try:
+        result = systemctl("show", SERVICE, "--no-pager",
+                           "--property=ActiveState,SubState,MainPID,UnitFileState,FragmentPath,NRestarts", check=False)
+        return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    except BridgeError:
+        return {}
+
+
+def unit_path(config):
+    return config.parent / "systemd/user" / SERVICE
+
+
+def unit_quote(value):
+    value = str(value)
+    if any(ord(c) < 32 for c in value):
+        raise BridgeError("Service paths cannot contain control characters.")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
+
+
+def service_unit(script, settings_file):
+    command = " ".join(unit_quote(x) for x in
+                       (sys.executable, script, "daemon", "--settings", settings_file, "--supervised"))
+    return (UNIT_MARKER + "[Unit]\nDescription=Automatic OBS hotkeys for Hyprland\n\n"
+            "[Service]\nType=simple\nExecStart=" + command + "\n"
+            "Restart=always\nRestartSec=3\nTimeoutStopSec=20\n"
+            "StandardOutput=journal\nStandardError=journal\nSyslogIdentifier=hypr-obs\n\n"
+            "[Install]\nWantedBy=default.target\n")
+
+
+def check_owned_unit(path):
+    if path.is_symlink() or (path.exists() and (path.stat().st_uid != os.geteuid()
+                                               or not read_text(path).startswith(UNIT_MARKER))):
+        raise BridgeError(f"An unmanaged service file exists at {path}; it was left untouched.")
+
+
+def remember_session(hypr, state):
+    values = {name: os.environ[name] for name in SESSION_VARIABLES if os.environ.get(name)}
+    values["HYPRLAND_INSTANCE_SIGNATURE"] = hypr.signature
+    save_json(state / "session.json", values)
+
+
+def refresh_session(state):
+    path = state / "session.json"
+    if not path.is_file():
+        return
+    values = read_json(path)
+    for name in SESSION_VARIABLES:
+        if name in values:
+            value = values[name]
+            if not isinstance(value, str) or any(ord(c) < 32 for c in value):
+                raise BridgeError("Invalid saved session environment.")
+            os.environ[name] = value
+        elif name in ("HYPRLAND_INSTANCE_SIGNATURE", "WAYLAND_DISPLAY", "DISPLAY"):
+            os.environ.pop(name, None)
+
+
+def resolve_settings(args):
+    path = Path(args.settings) if getattr(args, "settings", None) else paths()[0] / "settings.json"
+    if not path.is_file():
+        raise BridgeError("Forwarding is not configured yet. Run hypr-obs enable inside Hyprland.")
+    return path, read_json(path)
+
+
+def stop_runtime(settings):
+    if settings.get("supervisor") == "systemd":
+        systemctl("stop", SERVICE)
+    stop_daemon(Path(settings["state_dir"]))
+
+
 def start_daemon(config, state, script):
+    settings = read_json(config / "settings.json")
+    if settings.get("supervisor") == "systemd":
+        path = Path(settings["unit_path"])
+        check_owned_unit(path)
+        atomic_write(path, service_unit(script, config / "settings.json"), mode=0o644)
+        systemctl("daemon-reload")
+        systemctl("enable", str(path))
+        systemctl("restart", SERVICE)
+        return
     private_dir(state)
     log = state / "bridge.log"
     if log.is_file() and log.stat().st_size > 1024 * 1024:
@@ -1110,31 +1225,49 @@ def install(args):
         supplied = getattr(args, name, None)
         return supplied if supplied is not None else (previous or {}).get(name, default)
     obs_config = preference("obs_config")
+    preference_supervisor = getattr(args, "supervisor", None) or (previous or {}).get("supervisor_preference", "auto")
+    manager = systemd_available() if preference_supervisor != "process" else False
+    if preference_supervisor == "systemd" and not manager:
+        raise BridgeError("The systemd user manager is unavailable. Run from your desktop session or use --supervisor process.")
+    supervisor = "systemd" if manager else "process"
+    service_path = unit_path(config)
+    if supervisor == "systemd":
+        check_owned_unit(service_path)
+    unit_before = service_path.read_bytes() if service_path.is_file() else None
+    was_service = previous and previous.get("supervisor") == "systemd"
     settings = {
         "version": VERSION, "token": previous["token"] if previous else uuid.uuid4().hex[:12],
         "hypr_config": str(root), "backend": hypr.backend,
         "obs_config": str(expand_path(obs_config).resolve()) if obs_config else None,
         "obs_pid": preference("obs_pid"), "profile": preference("profile"), "collection": preference("collection"),
         "interval": preference("interval", 3.0), "state_dir": str(state),
+        "supervisor": supervisor, "supervisor_preference": preference_supervisor,
+        "unit_path": str(service_path) if supervisor == "systemd" else None,
     }
     # Validate actual OBS files before installing when OBS is already running.
     requests, instances, issues = collect(hypr, settings)
     preview = reconcile(hypr, requests, settings["token"], apply=False)
     script = config / (NAME + ".py")
     bootstrap = config / ("startup.lua" if hypr.backend == "lua" else "startup.conf")
-    command = shlex.join([sys.executable, str(script), "daemon", "--settings", str(settings_file)])
+    command = shlex.join([sys.executable, str(script), "start", "--settings", str(settings_file), "--from-session"])
     if any(c in command for c in "\r\n"):
         raise BridgeError("Install paths cannot contain newlines.")
     if hypr.backend == "lua":
-        bootstrap_text = "-- Start one daemon; its session lock prevents duplicates on reload.\n" + \
-                         f"hl.exec_cmd({lua_string(command)})\n"
+        bootstrap_text = ("-- Start once per compositor session; stop remains effective across reloads.\n"
+                          "hl.on(\"hyprland.start\", function()\n"
+                          f"    hl.exec_cmd({lua_string(command)})\nend)\n")
     else:
         if any(c in command for c in "#$"):
             raise BridgeError("Hyprlang startup paths containing # or $ are unsupported.")
         bootstrap_text = "# Start the bridge once in this Hyprland session.\nexec-once = " + command + "\n"
     block = bootstrap_block(hypr.backend, bootstrap)
     if previous:
-        stop_daemon(state)
+        stop_runtime(previous)
+        if was_service and supervisor != "systemd":
+            systemctl("disable", SERVICE)
+            check_owned_unit(service_path)
+            service_path.unlink(missing_ok=True)
+            systemctl("daemon-reload")
     original_script = Path(__file__).resolve().read_bytes()
     atomic_write(script, original_script, mode=0o700)
     atomic_write(bootstrap, bootstrap_text)
@@ -1148,18 +1281,33 @@ def install(args):
         settings["added_hook"] = added.decode("utf-8") if added else (previous or {}).get("added_hook", block)
         settings["backup"] = str(backup)
         save_json(settings_file, settings)
+        remember_session(hypr, state)
         # No compositor reload is needed: bindings are installed dynamically.
         start_daemon(config, state, script)
     except Exception:
+        if supervisor == "systemd":
+            systemctl("stop", SERVICE, check=False)
+            if not was_service:
+                systemctl("disable", SERVICE, check=False)
+            if unit_before is None:
+                service_path.unlink(missing_ok=True)
+            else:
+                atomic_write(service_path, unit_before)
+            systemctl("daemon-reload", check=False)
         # Restore only this install's exact root mutation on a failed install.
         if added:
             remove_hook(root, added.decode("utf-8"))
         if previous:
             save_json(settings_file, previous)
+            try:
+                # Keep an existing installation usable after a failed update.
+                start_daemon(config, state, script)
+            except (BridgeError, OSError):
+                pass
         elif settings_file.is_file():
             settings_file.unlink()
         raise
-    print(f"Installed {NAME} {VERSION}; parent: {root} ({hypr.backend}).")
+    print(f"Enabled {NAME} {VERSION}; supervisor={supervisor}; parent: {root} ({hypr.backend}).")
     print(f"Detected {len(instances)} OBS instance(s), {len(preview['forwarded'])} forwardable saved shortcut(s).")
     for issue in dict.fromkeys(issues + preview["issues"]):
         print("  " + issue)
@@ -1178,26 +1326,16 @@ def socket_path(hypr):
     return None
 
 
-def daemon(args):
-    settings_file = Path(args.settings)
-    settings = read_json(settings_file)
+def daemon_session(settings, hypr, stopping, supervised=False):
     state = Path(settings["state_dir"])
     private_dir(state)
-    hypr = Hyprland()
     lock = state / ("session-" + digest(hypr.signature)[:16] + ".lock")
     with lock.open("a+") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return 0
-        stopped = False
-
-        def stop(_number, _frame):
-            nonlocal stopped
-            stopped = True
-
-        signal.signal(signal.SIGTERM, stop)
-        signal.signal(signal.SIGINT, stop)
+            print("Another OBS hotkey worker is already attached to this session.", flush=True)
+            return False
         event_socket = None
         buffer = b""
         last_status = None
@@ -1207,9 +1345,11 @@ def daemon(args):
         last_result = None
         last_probe = 0.0
         record = {"daemon_pid": os.getpid(), "script": str(Path(__file__).resolve()),
+                  "launcher": str(Path(sys.argv[0]).absolute()),
                   "session": hypr.signature, "backend": hypr.backend,
-                  "hypr_config": settings["hypr_config"], "started": stamp()}
-        while not stopped:
+                  "hypr_config": settings["hypr_config"], "started": stamp(),
+                  "supervisor": "systemd" if supervised else "process", "phase": "starting"}
+        while not stopping.is_set():
             now = time.monotonic()
             try:
                 if event_socket is None and now - last_probe >= 5:
@@ -1240,7 +1380,7 @@ def daemon(args):
                         result = {**last_result, "updates": 0}
                     record.update(result)
                     record.update({"instances": instances, "issues": list(dict.fromkeys(issues + result["issues"])),
-                                   "error": None, "updated": stamp()})
+                                   "error": None, "updated": stamp(), "phase": "watching", "message": None})
                     save_json(state / "status.json", record)
                     # Log only changes, not every heartbeat.
                     summary = json.dumps({k: record.get(k) for k in ("instances", "forwarded", "issues", "error")}, sort_keys=True)
@@ -1255,7 +1395,7 @@ def daemon(args):
                     if readable:
                         data = event_socket.recv(65536)
                         if not data:
-                            break  # compositor shut down; do not attach to another session
+                            break  # outer worker waits for the next compositor session
                         buffer += data
                         while b"\n" in buffer:
                             line, buffer = buffer.split(b"\n", 1)
@@ -1266,9 +1406,9 @@ def daemon(args):
                         if len(buffer) > 1024 * 1024:
                             buffer = b""
                 else:
-                    time.sleep(timeout)
+                    stopping.wait(timeout)
             except (BridgeError, OSError, ValueError, TypeError) as exc:
-                record.update({"error": str(exc), "updated": stamp()})
+                record.update({"error": str(exc), "updated": stamp(), "phase": "retrying"})
                 save_json(state / "status.json", record)
                 if str(exc) != last_status:
                     print(stamp(), "Waiting:", str(exc), flush=True)
@@ -1276,29 +1416,164 @@ def daemon(args):
                 # Broken JSON during OBS save is retried; the desktop is untouched.
                 if not (PROC / str(hypr.pid)).exists():
                     break
-                time.sleep(min(settings.get("interval", 3.0), 2.0))
+                if isinstance(exc, BridgeError) and str(exc).startswith(("Cannot read Hyprland", "hyprctl failed:")):
+                    break  # reconnect through the outer session-discovery loop
+                if isinstance(exc, OSError) and event_socket:
+                    event_socket.close()
+                    event_socket = None
+                stopping.wait(min(settings.get("interval", 3.0), 2.0))
         if event_socket:
             event_socket.close()
         try:
             reconcile(hypr, [], settings["token"])
         except BridgeError:
             pass
-        record.update({"stopped": stamp(), "daemon_pid": 0})
+        record.update({"updated": stamp(), "instances": [], "forwarded": [],
+                       "phase": "stopped" if stopping.is_set() else "waiting_for_hyprland",
+                       "daemon_pid": 0 if stopping.is_set() else os.getpid()})
+        if stopping.is_set():
+            record["stopped"] = stamp()
         save_json(state / "status.json", record)
+    return True
+
+
+def daemon(args):
+    settings_file, settings = resolve_settings(args)
+    state = Path(settings["state_dir"])
+    private_dir(state)
+    stopping = threading.Event()
+    signal.signal(signal.SIGTERM, lambda _number, _frame: stopping.set())
+    signal.signal(signal.SIGINT, lambda _number, _frame: stopping.set())
+    with (state / "worker.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("hypr-obs is already running. Use hypr-obs status or hypr-obs restart.")
+            return 0
+        reported = None
+        try:
+            while not stopping.is_set():
+                try:
+                    if getattr(args, "supervised", False):
+                        refresh_session(state)
+                    hypr = Hyprland(allow_stale_session=True)
+                except BridgeError as exc:
+                    message = str(exc)
+                    save_json(state / "status.json", {
+                        "daemon_pid": os.getpid(), "script": str(Path(__file__).resolve()),
+                        "launcher": str(Path(sys.argv[0]).absolute()),
+                        "supervisor": "systemd" if getattr(args, "supervised", False) else "process",
+                        "phase": "waiting_for_hyprland", "message": message,
+                        "hypr_config": settings["hypr_config"], "updated": stamp(),
+                        "instances": [], "forwarded": [], "issues": [], "error": None,
+                    })
+                    if message != reported:
+                        print(stamp(), "Waiting for Hyprland:", message, flush=True)
+                        reported = message
+                    stopping.wait(min(settings.get("interval", 3.0), 3.0))
+                    continue
+                reported = None
+                settings = read_json(settings_file)
+                if not daemon_session(settings, hypr, stopping, getattr(args, "supervised", False)):
+                    return 0
+                if not stopping.is_set():
+                    stopping.wait(0.5)
+        finally:
+            path = state / "status.json"
+            if path.is_file():
+                record = read_json(path)
+                if record.get("daemon_pid") in (0, os.getpid()):
+                    record.update({"stopped": stamp(), "phase": "stopped", "daemon_pid": 0})
+                    save_json(path, record)
+    return 0
+
+
+def control_runtime(args):
+    settings_file, settings = resolve_settings(args)
+    state = Path(settings["state_dir"])
+    action = args.command
+    if action == "stop":
+        stop_runtime(settings)
+        print("Stopped hypr-obs. Login autostart remains enabled; use disable to remove it.")
+        return 0
+    old_status = read_json(state / "status.json") if (state / "status.json").is_file() else {}
+    current_session = None
+    if getattr(args, "from_session", False) or os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        current_session = Hyprland()
+        remember_session(current_session, state)
+    if settings.get("supervisor") == "systemd":
+        if running_daemon(old_status) and old_status.get("supervisor") != "systemd":
+            stop_daemon(state)  # adopt a foreground/old detached worker first
+        changed = current_session and old_status.get("session") not in (None, current_session.signature)
+        systemctl("restart" if action == "restart" or changed else "start", SERVICE)
+    else:
+        if running_daemon(old_status):
+            if action != "restart":
+                print("hypr-obs is already running.")
+                return 0
+            stop_daemon(state)
+        start_daemon(settings_file.parent, state, settings_file.parent / (NAME + ".py"))
+    print(("Restarted" if action == "restart" else "Started") + " hypr-obs (" + settings.get("supervisor", "process") + ").")
+    return 0
+
+
+def logs(args):
+    _settings_file, settings = resolve_settings(args)
+    if settings.get("supervisor") == "systemd":
+        binary = shutil.which("journalctl")
+        if not binary:
+            raise BridgeError("journalctl is missing. Use systemctl --user status hypr-obs.service.")
+        command = [binary, "--user", "--unit=" + SERVICE, "--no-pager", "--output=cat", "--lines=" + str(args.lines)]
+        if args.follow:
+            command.append("--follow")
+        try:
+            return subprocess.run(command, check=False).returncode
+        except KeyboardInterrupt:
+            return 0
+    path = Path(settings["state_dir"]) / "bridge.log"
+    if not path.is_file():
+        print("No log yet. Run hypr-obs start.")
+        return 0
+    with path.open(encoding="utf-8", errors="replace") as stream:
+        print("".join(stream.readlines()[-args.lines:]), end="", flush=True)
+        if args.follow:
+            try:
+                while True:
+                    line = stream.readline()
+                    if line:
+                        print(line, end="", flush=True)
+                    else:
+                        time.sleep(0.3)
+            except KeyboardInterrupt:
+                pass
     return 0
 
 
 def show_status(args):
     config, state = paths()
     status_file = state / "status.json"
-    if not status_file.is_file():
-        raise BridgeError("No bridge status yet. Run install, or inspect doctor first.")
-    status = read_json(status_file)
+    settings_file = config / "settings.json"
+    settings = read_json(settings_file) if settings_file.is_file() else {}
+    status = read_json(status_file) if status_file.is_file() else {
+        "daemon_pid": 0, "phase": "starting" if settings else "not_enabled",
+        "hypr_config": settings.get("hypr_config"), "instances": [], "forwarded": [], "issues": []}
     status["running"] = running_daemon(status) is not None
+    status["supervisor"] = settings.get("supervisor", status.get("supervisor", "process"))
+    if status["supervisor"] == "systemd":
+        info = service_info()
+        status["service"] = info
+        status["running"] = status["running"] or (info.get("ActiveState") == "active" and int(info.get("MainPID", "0")) > 0)
     if args.json:
         print(json.dumps(status, indent=2, ensure_ascii=False))
     else:
-        print(f"Bridge {'running' if status['running'] else 'stopped'}; backend={status.get('backend')}; updated={status.get('updated', '?')}")
+        print(f"hypr-obs {'running' if status['running'] else 'stopped'}; supervisor={status['supervisor']}; phase={status.get('phase', '?')}")
+        if status.get("service"):
+            info = status["service"]
+            print(f"Service: {info.get('ActiveState', '?')}/{info.get('SubState', '?')}; PID={info.get('MainPID', '?')}; restarts={info.get('NRestarts', '?')}")
+        if status.get("message"):
+            print(status["message"])
+        if not settings:
+            print("Run hypr-obs enable inside Hyprland to configure automatic forwarding.")
         print("Hyprland parent:", status.get("hypr_config"))
         for instance in status.get("instances", []):
             print(f"OBS PID {instance['pid']}, window {instance['address']}, workspace {instance.get('workspace')}")
@@ -1313,8 +1588,9 @@ def show_status(args):
             print("  " + issue)
         if status.get("error"):
             print("ERROR:", status["error"])
-        print("Log:", state / "bridge.log")
-    return 0 if status["running"] and not status.get("error") else 1
+        print("Logs: hypr-obs logs --follow" if status["supervisor"] == "systemd" else "Log: " + str(state / "bridge.log"))
+    active = status["running"] or status.get("service", {}).get("ActiveState") == "activating"
+    return 0 if active and not status.get("error") else 1
 
 
 def doctor(args):
@@ -1344,8 +1620,15 @@ def disable(_args):
         print("Automatic forwarding is already disabled.")
         return 0
     settings = read_json(settings_file)
+    service_path = Path(settings.get("unit_path") or unit_path(config))
+    if settings.get("supervisor") == "systemd":
+        check_owned_unit(service_path)
     # Remove the autostart entry first, so an auto-reload cannot respawn it.
     remove_hook(Path(settings["hypr_config"]), settings.get("added_hook", ""))
+    if settings.get("supervisor") == "systemd":
+        systemctl("disable", "--now", SERVICE)
+        service_path.unlink(missing_ok=True)
+        systemctl("daemon-reload")
     stop_daemon(state)
     try:
         hypr = Hyprland()
@@ -1356,6 +1639,7 @@ def disable(_args):
         path = config / filename
         if path.is_file():
             path.unlink()
+    (state / "session.json").unlink(missing_ok=True)
     try:
         config.rmdir()
     except OSError:
@@ -1458,24 +1742,40 @@ def main(argv=None):
         command.add_argument("--collection", help="Override the active scene collection filename, stem or display name")
         if name != "doctor":
             command.add_argument("--interval", type=float, help="Saved-config polling seconds (minimum 1, default 3)")
+            command.add_argument("--supervisor", choices=("auto", "systemd", "process"),
+                                 help="Prefer a supervised systemd user service when available (default auto)")
         if name == "setup":
             command.add_argument("--no-enable", action="store_true", help="Install only the command, for use outside a Hyprland session")
             command.add_argument("--bin-dir", help="Command directory (default ~/.local/bin or XDG_BIN_HOME)")
     command = commands.add_parser("status", help="Show forwarding, conflicts and errors")
     command.add_argument("--json", action="store_true")
     command.set_defaults(function=show_status)
+    for name in ("start", "stop", "restart"):
+        command = commands.add_parser(name, help=name.capitalize() + " the background watcher")
+        command.add_argument("--settings", help="Settings file (automatically discovered by default)")
+        command.add_argument("--from-session", action="store_true", help=argparse.SUPPRESS)
+        command.set_defaults(function=control_runtime)
+    command = commands.add_parser("logs", help="Show watcher logs")
+    command.add_argument("--settings", help="Settings file (automatically discovered by default)")
+    command.add_argument("-f", "--follow", action="store_true", help="Follow live log output")
+    command.add_argument("-n", "--lines", type=int, default=50, help="Recent lines (default 50)")
+    command.set_defaults(function=logs)
     command = commands.add_parser("disable", help="Stop forwarding and remove autostart; keep the command")
     command.set_defaults(function=disable)
     command = commands.add_parser("uninstall", help="Disable forwarding and remove the standalone command")
     command.set_defaults(function=uninstall)
-    command = commands.add_parser("daemon", help="Internal background process (started by install)")
-    command.add_argument("--settings", required=True)
+    command = commands.add_parser("daemon", help="Run the watcher in the foreground; enable runs it as a background service",
+                                  description="Watch saved OBS/Aitum hotkeys continuously in the foreground. Settings are discovered automatically. Use 'hypr-obs enable' for the background service.")
+    command.add_argument("--settings", help="Settings file (automatically discovered by default)")
+    command.add_argument("--supervised", action="store_true", help=argparse.SUPPRESS)
     command.set_defaults(function=daemon)
     args = parser.parse_args(argv)
     if getattr(args, "interval", None) is not None and args.interval < 1:
         parser.error("--interval must be at least 1 second")
     if getattr(args, "obs_pid", None) is not None and args.obs_pid <= 0:
         parser.error("--obs-pid must be positive")
+    if hasattr(args, "lines") and not 1 <= args.lines <= 10000:
+        parser.error("--lines must be between 1 and 10000")
     try:
         return args.function(args)
     except (BridgeError, OSError, ValueError, KeyError) as exc:
