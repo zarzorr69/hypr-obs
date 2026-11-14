@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2 — 2026-11-14
+
+- Let bare `hypr-obs` enable or refresh forwarding with automatic per-OBS
+  Wayland/XWayland detection; explicit `enable` remains supported.
+- Default to native Wayland `pass` and XWayland keyboard `sendshortcut`,
+  while always keeping mouse hotkeys on `pass`; manual override remains.
+- Add `hypr-obs remove` for managed command, service, config-hook and state
+  cleanup, preserving unrelated files and leaving upstream OBS/Hyprland intact.
+- Add tests for bare command, mode selection, removal and migration from
+  previous saved `pass` default.
+
 ## 0.2.1 — 2026-11-14
 
 - Add explicit XWayland OBS forwarding mode with a configurable `sendshortcut`
