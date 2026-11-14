@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 NAME = "hypr-obs"
 LEGACY_NAME = "obs-hotkey-bridge"
 SERVICE = "hypr-obs.service"
@@ -1021,10 +1021,14 @@ def collect(hypr, settings):
                 continue
         saved = load_hotkeys(root, settings.get("profile"), settings.get("collection"))
         xwayland = bool(window.get("xwayland"))
-        xwayland_dispatcher = settings.get("xwayland_dispatcher", "pass")
-        if xwayland_dispatcher not in ("pass", "sendshortcut"):
+        xwayland_dispatcher = settings.get("xwayland_dispatcher", "auto")
+        if xwayland_dispatcher not in ("auto", "pass", "sendshortcut"):
             raise BridgeError(f"Unsupported XWayland dispatcher: {xwayland_dispatcher}")
-        dispatcher = xwayland_dispatcher if xwayland else "pass"
+        # Hyprland is always a Wayland compositor, but OBS may be an X11
+        # client using XWayland. Select per mapped OBS window rather than from
+        # DISPLAY/WAYLAND_DISPLAY, which can both be set in the same session.
+        dispatcher = ("sendshortcut" if xwayland_dispatcher == "auto"
+                      else xwayland_dispatcher) if xwayland else "pass"
         # Hyprland's sendshortcut is keyboard-only; retain press/release
         # forwarding through pass for OBS mouse buttons and push-to-talk.
         requests.extend(Request(chord, window["address"], actions,
@@ -1267,7 +1271,9 @@ def install(args):
         "hypr_config": str(root), "backend": hypr.backend,
         "obs_config": str(expand_path(obs_config).resolve()) if obs_config else None,
         "obs_pid": preference("obs_pid"), "profile": preference("profile"), "collection": preference("collection"),
-        "xwayland_dispatcher": preference("xwayland_dispatcher", "pass"),
+        # A plain 'hypr-obs' / 'hypr-obs enable' always opts into automatic
+        # per-window detection. An explicit flag can override this for debugging.
+        "xwayland_dispatcher": getattr(args, "xwayland_dispatcher", None) or "auto",
         "interval": preference("interval", 3.0), "state_dir": str(state),
         "supervisor": supervisor, "supervisor_preference": preference_supervisor,
         "unit_path": str(service_path) if supervisor == "systemd" else None,
@@ -1633,7 +1639,7 @@ def doctor(args):
                 "obs_pid": args.obs_pid or installed.get("obs_pid"),
                 "profile": args.profile or installed.get("profile"),
                 "collection": args.collection or installed.get("collection"),
-                "xwayland_dispatcher": args.xwayland_dispatcher or installed.get("xwayland_dispatcher", "pass")}
+                "xwayland_dispatcher": args.xwayland_dispatcher or installed.get("xwayland_dispatcher", "auto")}
     root = detect_config(hypr, args.hypr_config or installed.get("hypr_config"))
     requests, instances, issues = collect(hypr, settings)
     result = reconcile(hypr, requests, installed.get("token", "preview"), apply=False)
@@ -1757,6 +1763,37 @@ def uninstall(args):
     return 0
 
 
+def remove(args):
+    """Completely remove our managed install, preserving unrelated files."""
+    require_desktop_user()
+    # 'uninstall' is kept as a legacy alias which preserves diagnostics.
+    # Stop the runtime, remove the managed Hyprland hook and service, and
+    # verify the command checksum before touching diagnostic state.
+    result = uninstall(args)
+    if result:
+        return result
+    _config, state = paths()
+    if not state.is_dir():
+        return 0
+    if state.is_symlink() or state.stat().st_uid != os.geteuid():
+        raise BridgeError(f"Cannot clean up unmanaged state directory: {state}")
+    managed = {"status.json", "bridge.log", "worker.lock", "session.json"}
+    for child in state.iterdir():
+        name = child.name
+        known = (name in managed
+                 or re.fullmatch(r"session-[0-9a-f]{16}\\.lock", name)
+                 or re.fullmatch(r"hyprland-before-[0-9a-f]{16}(?:\\.[A-Za-z0-9_-]+)?", name))
+        if known and not child.is_symlink() and child.is_file() and child.stat().st_uid == os.geteuid():
+            child.unlink()
+    try:
+        state.rmdir()
+    except OSError:
+        print("Retained unrecognized files in:", state)
+    else:
+        print("Removed managed state:", state)
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog=NAME, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=VERSION)
@@ -1773,8 +1810,8 @@ def main(argv=None):
         command.add_argument("--obs-pid", type=int, help="Select one running OBS PID; a restart changes this PID")
         command.add_argument("--profile", help="Override saved active OBS profile directory/name")
         command.add_argument("--collection", help="Override the active scene collection filename, stem or display name")
-        command.add_argument("--xwayland-dispatcher", choices=("pass", "sendshortcut"),
-                             help="XWayland OBS forwarding (default pass); sendshortcut is an experimental keyboard fallback")
+        command.add_argument("--xwayland-dispatcher", choices=("auto", "pass", "sendshortcut"),
+                             help="XWayland OBS forwarding (default auto: sendshortcut); pass is available as a fallback")
         if name != "doctor":
             command.add_argument("--interval", type=float, help="Saved-config polling seconds (minimum 1, default 3)")
             command.add_argument("--supervisor", choices=("auto", "systemd", "process"),
@@ -1799,12 +1836,17 @@ def main(argv=None):
     command.set_defaults(function=disable)
     command = commands.add_parser("uninstall", help="Disable forwarding and remove the standalone command")
     command.set_defaults(function=uninstall)
+    command = commands.add_parser("remove", help="Uninstall and clean up all managed configuration, service and state files")
+    command.set_defaults(function=remove)
     command = commands.add_parser("daemon", help="Run the watcher in the foreground; enable runs it as a background service",
                                   description="Watch saved OBS/Aitum hotkeys continuously in the foreground. Settings are discovered automatically. Use 'hypr-obs enable' for the background service.")
     command.add_argument("--settings", help="Settings file (automatically discovered by default)")
     command.add_argument("--supervised", action="store_true", help=argparse.SUPPRESS)
     command.set_defaults(function=daemon)
-    args = parser.parse_args(argv)
+    # No arguments is the everyday setup command. Explicit --help/--version
+    # and all subcommands still retain argparse's normal behavior.
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(argv or ["enable"])
     if getattr(args, "interval", None) is not None and args.interval < 1:
         parser.error("--interval must be at least 1 second")
     if getattr(args, "obs_pid", None) is not None and args.obs_pid <= 0:
