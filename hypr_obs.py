@@ -1766,13 +1766,15 @@ def uninstall(args):
 def remove(args):
     """Completely remove our managed install, preserving unrelated files."""
     require_desktop_user()
+    # Capture the selected XDG/legacy storage before uninstall removes its
+    # settings/receipt, which are used by paths() to recognize older installs.
+    _config, state = paths()
     # 'uninstall' is kept as a legacy alias which preserves diagnostics.
     # Stop the runtime, remove the managed Hyprland hook and service, and
     # verify the command checksum before touching diagnostic state.
     result = uninstall(args)
     if result:
         return result
-    _config, state = paths()
     if not state.is_dir():
         return 0
     if state.is_symlink() or state.stat().st_uid != os.geteuid():
