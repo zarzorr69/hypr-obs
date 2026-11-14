@@ -413,6 +413,28 @@ class Discovery(FilesystemTest):
         self.assertTrue(any(r.chord.key.startswith("mouse:") and r.dispatcher == "pass"
                             for r in requests))
 
+    def test_default_mode_auto_selects_per_obs_window(self):
+        root = self.obs()
+        clients = [window(pid=90, address="0xabc"),
+                   window(pid=91, address="0xdef", **{"class": "obs", "xwayland": True})]
+        with patch.object(b, "obs_root", return_value=root):
+            requests, instances, issues = b.collect(FakeHypr(clients=clients), {})
+        modes = {(instance["pid"], instance["xwayland"], instance["hotkey_dispatcher"])
+                 for instance in instances}
+        self.assertEqual(modes, {(90, False, "pass"), (91, True, "sendshortcut")})
+        self.assertTrue(any(req.address == "0xabc" and req.dispatcher == "pass"
+                            for req in requests))
+        self.assertTrue(any(req.address == "0xdef" and req.dispatcher == "sendshortcut"
+                            for req in requests))
+        self.assertTrue(any("XWayland" in issue for issue in issues))
+
+    def test_explicit_xwayland_pass_override(self):
+        with patch.object(b, "obs_root", return_value=self.obs()):
+            requests, instances, _ = b.collect(
+                FakeHypr(clients=[window(xwayland=True)]), {"xwayland_dispatcher": "pass"})
+        self.assertEqual(instances[0]["hotkey_dispatcher"], "pass")
+        self.assertEqual({req.dispatcher for req in requests}, {"pass"})
+
     def test_native_wayland_keeps_pass_even_with_xwayland_setting(self):
         with patch.object(b, "obs_root", return_value=self.obs()):
             requests, instances, _ = b.collect(
