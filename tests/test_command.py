@@ -135,7 +135,8 @@ class CommandInstall(FilesystemTest):
         root = self.write("hyprland.conf", "# user config\n")
         self.write("config/hypr-obs/settings.json",
                    json.dumps({"version": "0.2.1", "xwayland_dispatcher": "pass",
-                               "hypr_config": str(root), "supervisor": "process"}))
+                               "token": "oldtoken", "hypr_config": str(root),
+                               "supervisor": "process"}))
         args = argparse.Namespace(hypr_config=str(root), obs_config=None, obs_pid=None,
                                   profile=None, collection=None, interval=None,
                                   supervisor="process", xwayland_dispatcher=None)
