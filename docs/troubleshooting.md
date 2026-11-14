@@ -115,8 +115,20 @@ layouts, shifted punctuation and keypad NumLock behavior need a live check.
 
 1. Confirm it works with OBS focused.
 2. Set OBS's hotkey focus behavior to **Never disable hotkeys**.
-3. Check whether `status` reports XWayland. Hyprland documents limitations
-   forwarding keys between XWayland applications.
+3. Check whether `status` reports XWayland. OBS Flatpak launched with
+   `QT_QPA_PLATFORM=xcb` is an XWayland client and may identify as class `obs`.
+   XWayland uses Hyprland's `pass` dispatcher by default. If a **keyboard**
+   hotkey is registered but doesn't trigger OBS, try:
+   
+   ```sh
+   hypr-obs enable --xwayland-dispatcher sendshortcut
+   hypr-obs status
+   ```
+
+   This is an experimental alternative, not a universal workaround. Mouse
+   hotkeys always use `pass`, and native Wayland OBS is unchanged. To restore
+   the default, use `hypr-obs enable --xwayland-dispatcher pass`.
+   Re-enabling preserves your saved profile and instance settings.
 4. Test in a normal terminal workspace. An application inhibiting compositor
    shortcuts or capturing input may prevent the bind from running.
 
