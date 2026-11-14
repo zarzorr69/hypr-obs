@@ -400,12 +400,33 @@ class Discovery(FilesystemTest):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["pid"], 99)
 
+    def test_xwayland_obs_detected_and_mouse_stays_on_pass(self):
+        root = self.obs()
+        client = window(**{"class": "obs", "xwayland": True})
+        with patch.object(b, "obs_root", return_value=root):
+            requests, instances, issues = b.collect(
+                FakeHypr(clients=[client]), {"xwayland_dispatcher": "sendshortcut"})
+        self.assertEqual(instances[0]["hotkey_dispatcher"], "sendshortcut")
+        self.assertTrue(instances[0]["xwayland"])
+        self.assertTrue(any("XWayland" in issue for issue in issues))
+        self.assertTrue(any(r.dispatcher == "sendshortcut" for r in requests))
+        self.assertTrue(any(r.chord.key.startswith("mouse:") and r.dispatcher == "pass"
+                            for r in requests))
+
+    def test_native_wayland_keeps_pass_even_with_xwayland_setting(self):
+        with patch.object(b, "obs_root", return_value=self.obs()):
+            requests, instances, _ = b.collect(
+                FakeHypr(clients=[window()]), {"xwayland_dispatcher": "sendshortcut"})
+        self.assertEqual(instances[0]["hotkey_dispatcher"], "pass")
+        self.assertEqual({r.dispatcher for r in requests}, {"pass"})
+
 
 class Runtime(unittest.TestCase):
     token = "testowner"
 
-    def request(self, key="F9", address="0xabc", mods=5):
-        return b.Request(b.Chord(mods, key), address, {"OBSBasic.StartRecording", "OBSBasic.StopRecording"})
+    def request(self, key="F9", address="0xabc", mods=5, dispatcher="pass"):
+        return b.Request(b.Chord(mods, key), address,
+                         {"OBSBasic.StartRecording", "OBSBasic.StopRecording"}, dispatcher)
 
     def entry(self, request, **kwargs):
         return {"key": request.chord.key, "keycode": 0, "modmask": request.chord.mods,
@@ -430,6 +451,33 @@ class Runtime(unittest.TestCase):
         hypr.pass_table = False
         b.reconcile(hypr, [self.request()], self.token)
         self.assertIn('hl.dsp.pass("address:0xabc")', hypr.operations[0][1])
+
+    def test_xwayland_sendshortcut_hyprlang(self):
+        hypr = FakeHypr()
+        result = b.reconcile(hypr, [self.request(dispatcher="sendshortcut")], self.token)
+        self.assertEqual(result["forwarded"][0]["dispatcher"], "sendshortcut")
+        self.assertIn(", sendshortcut, SHIFT CTRL, F9, address:0xabc", hypr.operations[0][1])
+
+    def test_xwayland_sendshortcut_lua(self):
+        hypr = FakeHypr("lua")
+        b.reconcile(hypr, [self.request(dispatcher="sendshortcut")], self.token)
+        self.assertIn('hl.dsp.send_shortcut({mods="SHIFT CTRL",key="F9",window="address:0xabc"})',
+                      hypr.operations[0][1])
+
+    def test_switching_wayland_backend_replaces_old_binding(self):
+        old = self.request()
+        new = self.request(dispatcher="sendshortcut")
+        self.assertNotEqual(old.description(self.token), new.description(self.token))
+        hypr = FakeHypr(entries=[self.entry(old)])
+        b.reconcile(hypr, [new], self.token)
+        operations = hypr.operations[0][1]
+        self.assertLess(operations.index("keyword unbind"), operations.index("keyword bindd"))
+        self.assertIn("sendshortcut, SHIFT CTRL, F9, address:0xabc", operations)
+
+    def test_sendshortcut_rejects_mouse_keys(self):
+        with self.assertRaisesRegex(b.BridgeError, "mouse"):
+            b.add_operation(FakeHypr(), self.request(key="mouse:276", dispatcher="sendshortcut"),
+                            self.token)
 
     def test_repeat_reconcile_is_idempotent(self):
         request = self.request()
