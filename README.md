@@ -132,6 +132,7 @@ hypr-obs enable --hypr-config /path/to/active/hyprland.lua
 hypr-obs enable --obs-config /path/to/obs-studio
 hypr-obs enable --profile Work --collection Gaming.json
 hypr-obs enable --interval 5
+hypr-obs enable --xwayland-dispatcher sendshortcut  # optional XWayland keyboard fallback
 hypr-obs enable --supervisor systemd  # require a supervised user service
 hypr-obs enable --supervisor process  # non-systemd fallback
 ```
@@ -168,9 +169,17 @@ standalone uninstaller. Original config backups and logs are retained.
 
 ## Compatibility and validation
 
-This uses Hyprland's `pass` dispatcher and supports both Lua and older
-Hyprlang configurations. Native Wayland OBS is the intended delivery path.
-XWayland forwarding has compositor limitations, and hiding OBS to the tray
+This uses Hyprland's `pass` dispatcher by default and supports both Lua and
+older Hyprlang configurations. Native Wayland and XWayland OBS windows are
+detected (including the OBS X11 class `obs`). XWayland uses `pass` by default;
+if keyboard shortcuts fail, try `hypr-obs enable --xwayland-dispatcher sendshortcut`.
+The experimental fallback affects only keyboard hotkeys for XWayland OBS;
+mouse hotkeys continue to use `pass`, and native Wayland keeps `pass`.
+The running service notices a switch between Wayland and XWayland, and
+replaces its dispatcher bindings without needing to re-enable.
+
+XWayland forwarding has inherent compositor/application limitations; no
+dispatcher is guaranteed to work from every focused app. Hiding OBS to the tray
 removes its window target. Existing rice shortcuts are skipped and reported.
 
 The automated suite covers parsing, Aitum storage, native/Flatpak/Snap paths,
