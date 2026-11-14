@@ -84,6 +84,39 @@ class CommandInstall(FilesystemTest):
         self.assertTrue((self.bin_dir / "hypr-obs").is_file())
         self.assertTrue((self.config / "command.json").is_file())
 
+    def test_bare_command_enables_without_flags(self):
+        with patch.object(b, "install", return_value=0) as enable:
+            self.assertEqual(b.main([]), 0)
+        self.assertEqual(enable.call_args.args[0].command, "enable")
+        self.assertIsNone(enable.call_args.args[0].xwayland_dispatcher)
+
+    def test_remove_command_dispatches_to_cleanup(self):
+        with patch.object(b, "remove", return_value=0) as remove:
+            self.assertEqual(b.main(["remove"]), 0)
+        remove.assert_called_once()
+
+    def test_remove_purges_only_managed_files(self):
+        self.setup_command()
+        self.write("state/hypr-obs/status.json", "{}")
+        self.write("state/hypr-obs/bridge.log", "log")
+        self.write("state/hypr-obs/worker.lock", "")
+        self.write("state/hypr-obs/session-0123456789abcdef.lock", "")
+        self.write("state/hypr-obs/hyprland-before-0123456789abcdef.conf", "backup")
+        foreign = self.write("state/hypr-obs/keep-me.txt", "user data")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(b.remove(None), 0)
+        self.assertFalse((self.bin_dir / "hypr-obs").exists())
+        self.assertFalse((self.state / "bridge.log").exists())
+        self.assertFalse((self.state / "hyprland-before-0123456789abcdef.conf").exists())
+        self.assertTrue(foreign.exists())
+
+    def test_remove_cleans_state_dir_when_only_managed_files_exist(self):
+        self.setup_command()
+        self.write("state/hypr-obs/status.json", "{}")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(b.remove(None), 0)
+        self.assertFalse(self.state.exists())
+
     def test_uninstall_removes_only_managed_command(self):
         self.setup_command()
         other = self.write("bin/another-command", "not ours")
@@ -94,6 +127,24 @@ class CommandInstall(FilesystemTest):
         self.assertFalse((self.config / "command.json").exists())
         self.assertTrue(other.exists())
         self.assertTrue(backup.exists())
+
+    def test_bare_enable_uses_auto_even_after_older_saved_pass_setting(self):
+        self.setup_command()
+        # Installation settings are normally built inside install(); verify
+        # its default selection without creating any real daemon.
+        root = self.write("hyprland.conf", "# user config\n")
+        self.write("config/hypr-obs/settings.json",
+                   json.dumps({"version": "0.2.1", "xwayland_dispatcher": "pass",
+                               "token": "oldtoken", "hypr_config": str(root),
+                               "state_dir": str(self.state), "supervisor": "process"}))
+        args = argparse.Namespace(hypr_config=str(root), obs_config=None, obs_pid=None,
+                                  profile=None, collection=None, interval=None,
+                                  supervisor="process", xwayland_dispatcher=None)
+        with patch.object(b, "Hyprland", return_value=FakeHypr()), \
+             patch.object(b, "start_daemon"), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(b.install(args), 0)
+        settings = b.read_json(self.config / "settings.json")
+        self.assertEqual(settings["xwayland_dispatcher"], "auto")
 
     def test_enable_failure_leaves_a_usable_installed_command(self):
         self.args.no_enable = False

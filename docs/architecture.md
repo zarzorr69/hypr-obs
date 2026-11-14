@@ -14,7 +14,15 @@ hardcoding rice-specific include chains.
 OBS clients are identified by process/application identity and grouped by PID.
 The main window's address is used as the forwarding target. Workspace IDs are
 reported for inspection, but are not part of the binding: an OBS workspace move
-therefore does not invalidate the target.
+therefore does not invalidate the target. XWayland OBS is discovered by
+the same process and address mechanism (including the X11 `obs` window class).
+The XWayland dispatcher can be `auto`, `pass`, or `sendshortcut`.
+The default `auto` uses keyboard-only `sendshortcut` for XWayland
+clients and `pass` for native Wayland; mouse buttons always use `pass`.
+Switching window-system mode or dispatcher
+changes the desired bind plan, so the daemon removes stale runtime bindings
+and installs the new ones. This does not overcome Hyprland's XWayland
+input-forwarding limitations.
 
 Process XDG, Flatpak and Snap information locates OBS settings. The selected
 profile and collection are read from `user.ini` or older `global.ini`. OBS's

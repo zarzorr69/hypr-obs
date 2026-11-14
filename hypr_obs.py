@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 
-VERSION = "0.2.0"
+VERSION = "0.2.2"
 NAME = "hypr-obs"
 LEGACY_NAME = "obs-hotkey-bridge"
 SERVICE = "hypr-obs.service"
@@ -876,9 +876,12 @@ class Request:
     chord: Chord
     address: str
     actions: set
+    dispatcher: str = "pass"
 
     def description(self, token):
-        return f"OBS Hotkey Bridge {token} " + digest(self.address + repr(self.chord.identity))[:16]
+        # Preserve identities of previously installed 'pass' binds on upgrade.
+        extra = "|" + self.dispatcher if self.dispatcher != "pass" else ""
+        return f"OBS Hotkey Bridge {token} " + digest(self.address + repr(self.chord.identity) + extra)[:16]
 
 
 def foreign_conflicts(chord, entries, prefix):
@@ -908,13 +911,27 @@ def lua_string(value):
 
 def add_operation(hypr, request, token):
     description = request.description(token)
+    if request.dispatcher not in ("pass", "sendshortcut"):
+        raise BridgeError(f"Unsupported OBS forwarding dispatcher: {request.dispatcher}")
+    if request.dispatcher == "sendshortcut" and request.chord.key.startswith("mouse:"):
+        raise BridgeError("sendshortcut cannot forward mouse hotkeys; use pass")
     if hypr.backend == "lua":
         target = lua_string("address:" + request.address)
-        argument = "{window=" + target + "}" if hypr.pass_table else target
+        if request.dispatcher == "sendshortcut":
+            argument = ("{mods=" + lua_string(request.chord.mod_names) +
+                        ",key=" + lua_string(request.chord.key) + ",window=" + target + "}")
+            dispatcher = f"hl.dsp.send_shortcut({argument})"
+        else:
+            argument = "{window=" + target + "}" if hypr.pass_table else target
+            dispatcher = f"hl.dsp.pass({argument})"
         return ("__obs_hotkey_bridge=__obs_hotkey_bridge or {}; "
                 f"__obs_hotkey_bridge[{lua_string(description)}]="
-                f"hl.bind({lua_string(request.chord.lua)},hl.dsp.pass({argument}),"
+                f"hl.bind({lua_string(request.chord.lua)},{dispatcher},"
                 f"{{description={lua_string(description)}}})")
+    if request.dispatcher == "sendshortcut":
+        return (f"keyword bindd {request.chord.mod_names}, {request.chord.key}, "
+                f"{description}, sendshortcut, {request.chord.mod_names}, "
+                f"{request.chord.key}, address:{request.address}")
     return (f"keyword bindd {request.chord.mod_names}, {request.chord.key}, "
             f"{description}, pass, address:{request.address}")
 
@@ -952,7 +969,7 @@ def reconcile(hypr, requests, token, apply=True):
         grouped.setdefault(request.chord.identity, []).append(request)
     desired, issues = {}, []
     for group in grouped.values():
-        targets = {request.address for request in group}
+        targets = {(request.address, request.dispatcher) for request in group}
         chord = group[0].chord
         if len(targets) > 1:
             issues.append(f"{chord}: assigned in multiple OBS instances; skipped. Select --obs-pid or --obs-config.")
@@ -984,6 +1001,7 @@ def reconcile(hypr, requests, token, apply=True):
         execute_operations(hypr, operations)
     return {
         "forwarded": [{"keys": str(request.chord), "target": request.address,
+                       "dispatcher": request.dispatcher,
                        "actions": sorted(request.actions)} for request in desired.values()],
         "issues": issues,
         "updates": len(operations),
@@ -1002,14 +1020,27 @@ def collect(hypr, settings):
             if detected != root:
                 continue
         saved = load_hotkeys(root, settings.get("profile"), settings.get("collection"))
-        requests.extend(Request(chord, window["address"], actions)
+        xwayland = bool(window.get("xwayland"))
+        xwayland_dispatcher = settings.get("xwayland_dispatcher", "auto")
+        if xwayland_dispatcher not in ("auto", "pass", "sendshortcut"):
+            raise BridgeError(f"Unsupported XWayland dispatcher: {xwayland_dispatcher}")
+        # Hyprland is always a Wayland compositor, but OBS may be an X11
+        # client using XWayland. Select per mapped OBS window rather than from
+        # DISPLAY/WAYLAND_DISPLAY, which can both be set in the same session.
+        dispatcher = ("sendshortcut" if xwayland_dispatcher == "auto"
+                      else xwayland_dispatcher) if xwayland else "pass"
+        # Hyprland's sendshortcut is keyboard-only; retain press/release
+        # forwarding through pass for OBS mouse buttons and push-to-talk.
+        requests.extend(Request(chord, window["address"], actions,
+                                "pass" if chord.key.startswith("mouse:") else dispatcher)
                         for chord, actions in saved.hotkeys.items())
         issues.extend(saved.issues)
-        if window.get("xwayland"):
-            issues.append(f"OBS PID {window['pid']} runs through XWayland: cross-application forwarding may be unreliable.")
+        if xwayland:
+            issues.append(f"OBS PID {window['pid']} runs through XWayland using {dispatcher}: "
+                          "Hyprland cannot guarantee cross-application delivery; test hotkeys from your games.")
         instances.append({"pid": window["pid"], "address": window["address"],
                           "workspace": window.get("workspace"), "class": window.get("class"),
-                          "xwayland": bool(window.get("xwayland")), "config": str(root),
+                          "xwayland": xwayland, "hotkey_dispatcher": dispatcher, "config": str(root),
                           "profile": saved.profile, "collection": saved.collection,
                           "aitum_stream_suite": saved.aitum, "partial": saved.partial,
                           "hotkey_files": saved.files, "collection_candidates": saved.collection_candidates,
@@ -1240,6 +1271,9 @@ def install(args):
         "hypr_config": str(root), "backend": hypr.backend,
         "obs_config": str(expand_path(obs_config).resolve()) if obs_config else None,
         "obs_pid": preference("obs_pid"), "profile": preference("profile"), "collection": preference("collection"),
+        # A plain 'hypr-obs' / 'hypr-obs enable' always opts into automatic
+        # per-window detection. An explicit flag can override this for debugging.
+        "xwayland_dispatcher": getattr(args, "xwayland_dispatcher", None) or "auto",
         "interval": preference("interval", 3.0), "state_dir": str(state),
         "supervisor": supervisor, "supervisor_preference": preference_supervisor,
         "unit_path": str(service_path) if supervisor == "systemd" else None,
@@ -1368,7 +1402,8 @@ def daemon_session(settings, hypr, stopping, supervised=False):
                 if now - last_full >= settings.get("interval", 3.0):
                     last_full = now
                     requests, instances, issues = collect(hypr, settings)
-                    plan = tuple(sorted((r.chord.identity, r.address, tuple(sorted(r.actions))) for r in requests))
+                    plan = tuple(sorted((r.chord.identity, r.address, r.dispatcher,
+                                         tuple(sorted(r.actions))) for r in requests))
                     # Poll saved settings every interval, but query/reconcile
                     # compositor binds only when the plan changes, on an event,
                     # or once per 15 seconds to detect external runtime edits.
@@ -1576,14 +1611,17 @@ def show_status(args):
             print("Run hypr-obs enable inside Hyprland to configure automatic forwarding.")
         print("Hyprland parent:", status.get("hypr_config"))
         for instance in status.get("instances", []):
-            print(f"OBS PID {instance['pid']}, window {instance['address']}, workspace {instance.get('workspace')}")
+            print(f"OBS PID {instance['pid']}, window {instance['address']}, workspace {instance.get('workspace')}, "
+                  f"{'XWayland' if instance.get('xwayland') else 'Wayland'}, "
+                  f"dispatcher={instance.get('hotkey_dispatcher', 'pass')}")
             print(f"  {instance['config']} | profile={instance['profile']} | scenes={instance['collection']}")
             if instance.get("aitum_stream_suite"):
                 print("  Aitum Stream Suite: aitum.json detected")
             if instance.get("partial"):
                 print("  Partial discovery; see issues below or run doctor.")
         for forwarding in status.get("forwarded", []):
-            print("  " + forwarding["keys"] + " -> OBS " + forwarding["target"])
+            print("  " + forwarding["keys"] + " -> OBS " + forwarding["target"] +
+                  " (" + forwarding.get("dispatcher", "pass") + ")")
         for issue in status.get("issues", []):
             print("  " + issue)
         if status.get("error"):
@@ -1600,7 +1638,8 @@ def doctor(args):
     settings = {"obs_config": args.obs_config or installed.get("obs_config"),
                 "obs_pid": args.obs_pid or installed.get("obs_pid"),
                 "profile": args.profile or installed.get("profile"),
-                "collection": args.collection or installed.get("collection")}
+                "collection": args.collection or installed.get("collection"),
+                "xwayland_dispatcher": args.xwayland_dispatcher or installed.get("xwayland_dispatcher", "auto")}
     root = detect_config(hypr, args.hypr_config or installed.get("hypr_config"))
     requests, instances, issues = collect(hypr, settings)
     result = reconcile(hypr, requests, installed.get("token", "preview"), apply=False)
@@ -1724,6 +1763,39 @@ def uninstall(args):
     return 0
 
 
+def remove(args):
+    """Completely remove our managed install, preserving unrelated files."""
+    require_desktop_user()
+    # Capture the selected XDG/legacy storage before uninstall removes its
+    # settings/receipt, which are used by paths() to recognize older installs.
+    _config, state = paths()
+    # 'uninstall' is kept as a legacy alias which preserves diagnostics.
+    # Stop the runtime, remove the managed Hyprland hook and service, and
+    # verify the command checksum before touching diagnostic state.
+    result = uninstall(args)
+    if result:
+        return result
+    if not state.is_dir():
+        return 0
+    if state.is_symlink() or state.stat().st_uid != os.geteuid():
+        raise BridgeError(f"Cannot clean up unmanaged state directory: {state}")
+    managed = {"status.json", "bridge.log", "worker.lock", "session.json"}
+    for child in state.iterdir():
+        name = child.name
+        known = (name in managed
+                 or re.fullmatch(r"session-[0-9a-f]{16}\.lock", name)
+                 or re.fullmatch(r"hyprland-before-[0-9a-f]{16}(?:\.[A-Za-z0-9_-]+)?", name))
+        if known and not child.is_symlink() and child.is_file() and child.stat().st_uid == os.geteuid():
+            child.unlink()
+    try:
+        state.rmdir()
+    except OSError:
+        print("Retained unrecognized files in:", state)
+    else:
+        print("Removed managed state:", state)
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog=NAME, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=VERSION)
@@ -1740,6 +1812,8 @@ def main(argv=None):
         command.add_argument("--obs-pid", type=int, help="Select one running OBS PID; a restart changes this PID")
         command.add_argument("--profile", help="Override saved active OBS profile directory/name")
         command.add_argument("--collection", help="Override the active scene collection filename, stem or display name")
+        command.add_argument("--xwayland-dispatcher", choices=("auto", "pass", "sendshortcut"),
+                             help="XWayland OBS forwarding (default auto: sendshortcut); pass is available as a fallback")
         if name != "doctor":
             command.add_argument("--interval", type=float, help="Saved-config polling seconds (minimum 1, default 3)")
             command.add_argument("--supervisor", choices=("auto", "systemd", "process"),
@@ -1764,12 +1838,17 @@ def main(argv=None):
     command.set_defaults(function=disable)
     command = commands.add_parser("uninstall", help="Disable forwarding and remove the standalone command")
     command.set_defaults(function=uninstall)
+    command = commands.add_parser("remove", help="Uninstall and clean up all managed configuration, service and state files")
+    command.set_defaults(function=remove)
     command = commands.add_parser("daemon", help="Run the watcher in the foreground; enable runs it as a background service",
                                   description="Watch saved OBS/Aitum hotkeys continuously in the foreground. Settings are discovered automatically. Use 'hypr-obs enable' for the background service.")
     command.add_argument("--settings", help="Settings file (automatically discovered by default)")
     command.add_argument("--supervised", action="store_true", help=argparse.SUPPRESS)
     command.set_defaults(function=daemon)
-    args = parser.parse_args(argv)
+    # No arguments is the everyday setup command. Explicit --help/--version
+    # and all subcommands still retain argparse's normal behavior.
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(argv or ["enable"])
     if getattr(args, "interval", None) is not None and args.interval < 1:
         parser.error("--interval must be at least 1 second")
     if getattr(args, "obs_pid", None) is not None and args.obs_pid <= 0:

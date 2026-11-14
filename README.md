@@ -18,6 +18,9 @@ Run from a terminal in your Hyprland desktop, as your normal user:
 curl -fsSL https://raw.githubusercontent.com/zarzorr69/hypr-obs/main/install.sh | sh
 ```
 
+After installation, simply run `hypr-obs` to enable or refresh automatic OBS
+hotkey forwarding. No arguments or manual display mode selection are required.
+
 The installer adds `hypr-obs` to `~/.local/bin` and enables a continuously running
 **`hypr-obs.service` user service** when your systemd user manager is available.
 It starts at user login, waits for Hyprland/OBS, checks saved hotkeys every three
@@ -75,7 +78,8 @@ hypr-obs enable
 
 | Command | Result |
 | --- | --- |
-| `hypr-obs enable` | Discover OBS, install forwarding, and start it at login |
+| `hypr-obs` | Enable forwarding with automatic OBS Wayland/XWayland detection |
+| `hypr-obs enable` | Same as the no-argument command |
 | `hypr-obs start` | Start the configured watcher now |
 | `hypr-obs stop` | Stop it now while keeping login autostart configured |
 | `hypr-obs restart` | Restart the watcher |
@@ -85,7 +89,8 @@ hypr-obs enable
 | `hypr-obs doctor` | Preview discovery and conflicts without changing anything |
 | `hypr-obs daemon` | Run the watcher in the foreground for debugging; settings are automatic |
 | `hypr-obs disable` | Stop forwarding and remove its startup hook; keep the command |
-| `hypr-obs uninstall` | Disable forwarding and remove the standalone command |
+| `hypr-obs remove` | Remove managed service, startup hook, command, configuration, logs and state |
+| `hypr-obs uninstall` | Legacy removal command, preserving diagnostic logs/backups |
 | `hypr-obs --version` | Print the version |
 | `hypr-obs --help` | Show available commands |
 
@@ -132,6 +137,7 @@ hypr-obs enable --hypr-config /path/to/active/hyprland.lua
 hypr-obs enable --obs-config /path/to/obs-studio
 hypr-obs enable --profile Work --collection Gaming.json
 hypr-obs enable --interval 5
+hypr-obs enable --xwayland-dispatcher pass  # XWayland troubleshooting override (auto is default)
 hypr-obs enable --supervisor systemd  # require a supervised user service
 hypr-obs enable --supervisor process  # non-systemd fallback
 ```
@@ -159,18 +165,36 @@ For a checkout, pull changes and rerun `sh install.sh`. For pipx, use
 
 ```sh
 hypr-obs disable    # retain the command for later use
-hypr-obs uninstall  # remove a standalone installation
+hypr-obs remove     # fully remove managed installation, service, hooks and state
+hypr-obs uninstall  # legacy removal, retaining diagnostics
 ```
 
-For pipx installations, run `hypr-obs disable` followed by
+For pipx installations, run `hypr-obs remove` followed by
 `pipx uninstall hypr-obs`. Package-managed launchers are not deleted by the
-standalone uninstaller. Original config backups and logs are retained.
+standalone uninstaller. `remove` cleans up recognized files belonging to
+hypr-obs, but leaves unrelated files untouched. Original OBS profiles and
+other Hyprland configuration content are not removed.
 
 ## Compatibility and validation
 
-This uses Hyprland's `pass` dispatcher and supports both Lua and older
-Hyprlang configurations. Native Wayland OBS is the intended delivery path.
-XWayland forwarding has compositor limitations, and hiding OBS to the tray
+Hyprland itself is Wayland; OBS can be a native Wayland client or run through
+XWayland (including Flatpak launched with `QT_QPA_PLATFORM=xcb`). The daemon
+checks Hyprland's `clients` data for each OBS window, not your session's
+`DISPLAY` or `WAYLAND_DISPLAY` variables. With `hypr-obs` and no flags:
+
+- Native Wayland OBS automatically uses `pass`.
+- XWayland OBS automatically tries `sendshortcut` for keyboard shortcuts.
+- Mouse hotkeys always use `pass`.
+
+These settings are reapplied automatically when OBS launches, restarts or
+switches between display backends. Both Lua and Hyprlang are supported.
+Because XWayland input delivery varies by focused application, `sendshortcut`
+is not a guaranteed fix. If it doesn't work on your setup, try
+`hypr-obs enable --xwayland-dispatcher pass`. Running bare `hypr-obs` again
+restores automatic selection.
+
+XWayland forwarding has inherent compositor/application limitations; no
+dispatcher is guaranteed to work from every focused app. Hiding OBS to the tray
 removes its window target. Existing rice shortcuts are skipped and reported.
 
 The automated suite covers parsing, Aitum storage, native/Flatpak/Snap paths,
