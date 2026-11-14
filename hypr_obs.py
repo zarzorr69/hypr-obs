@@ -1783,8 +1783,8 @@ def remove(args):
     for child in state.iterdir():
         name = child.name
         known = (name in managed
-                 or re.fullmatch(r"session-[0-9a-f]{16}\\.lock", name)
-                 or re.fullmatch(r"hyprland-before-[0-9a-f]{16}(?:\\.[A-Za-z0-9_-]+)?", name))
+                 or re.fullmatch(r"session-[0-9a-f]{16}\.lock", name)
+                 or re.fullmatch(r"hyprland-before-[0-9a-f]{16}(?:\.[A-Za-z0-9_-]+)?", name))
         if known and not child.is_symlink() and child.is_file() and child.stat().st_uid == os.geteuid():
             child.unlink()
     try:
