@@ -117,18 +117,19 @@ layouts, shifted punctuation and keypad NumLock behavior need a live check.
 2. Set OBS's hotkey focus behavior to **Never disable hotkeys**.
 3. Check whether `status` reports XWayland. OBS Flatpak launched with
    `QT_QPA_PLATFORM=xcb` is an XWayland client and may identify as class `obs`.
-   XWayland uses Hyprland's `pass` dispatcher by default. If a **keyboard**
-   hotkey is registered but doesn't trigger OBS, try:
-   
+   Bare `hypr-obs` automatically uses `sendshortcut` for XWayland keyboard
+   hotkeys while native Wayland and mouse hotkeys use `pass`.
+   If a shortcut is registered but doesn't work, try the alternative XWayland
+   dispatcher:
+
    ```sh
-   hypr-obs enable --xwayland-dispatcher sendshortcut
+   hypr-obs enable --xwayland-dispatcher pass
    hypr-obs status
    ```
 
-   This is an experimental alternative, not a universal workaround. Mouse
-   hotkeys always use `pass`, and native Wayland OBS is unchanged. To restore
-   the default, use `hypr-obs enable --xwayland-dispatcher pass`.
-   Re-enabling preserves your saved profile and instance settings.
+   Neither dispatcher is universally reliable under XWayland. Bare
+   `hypr-obs` resets back to automatic per-window selection, and the
+   daemon updates bindings when OBS changes display backends.
 4. Test in a normal terminal workspace. An application inhibiting compositor
    shortcuts or capturing input may prevent the bind from running.
 
@@ -171,6 +172,10 @@ systemctl --user status hypr-obs.service
 
 The first command reports a missing/unreachable user manager directly. Run it
 inside the normal desktop session without sudo. See [Background service](service.md).
+
+Use `hypr-obs remove` to remove its managed files, service, startup entry,
+logs and backups. Unknown files in the hypr-obs state directory are preserved.
+The legacy `hypr-obs uninstall` retains diagnostics instead.
 
 Uninstall removes only the exact loader block originally added. If that block
 was edited, it is left intact with an explanation. It does not restore an old
