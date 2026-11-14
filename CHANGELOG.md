@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 — 2026-11-14
+
+- Add explicit XWayland OBS forwarding mode with a configurable `sendshortcut`
+  keyboard fallback (`--xwayland-dispatcher`); preserve `pass` by default.
+- Continue using press/release `pass` for mouse hotkeys and native Wayland OBS.
+- Reconcile dispatcher changes automatically when OBS switches between native
+  Wayland and XWayland; surface the selected dispatcher in status and doctor.
+- Test both Lua/Hyprlang dispatcher generation and fallback selection; document
+  why live XWayland delivery remains dependent on the compositor/application.
+
 ## 0.2.0 — 2026-11-04
 
 - Prefer an automatically enabled systemd user service with crash restart.
